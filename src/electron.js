@@ -172,6 +172,7 @@ let monitorsEventEmitter = new EventEmitter()
 let monitorsThreadReady = false
 let monitorsThreadStarting = false
 let monitorsThreadFailed = false
+let refreshAfterMonitorThreadRestart = false
 function startMonitorThread() {
   if((monitorsThreadReal?.connected && monitorsThreadReal?.exitCode === null) || monitorsThreadStarting || isWindowsUserIdle) return false;
   monitorsThreadReady = false
@@ -198,6 +199,10 @@ function startMonitorThread() {
           value: wmiBridgeOK
         })
         getLocalization()
+        if (refreshAfterMonitorThreadRestart) {
+          refreshAfterMonitorThreadRestart = false
+          setTimeout(() => refreshMonitors(true, true), 0)
+        }
       }
       if (data.type === "ddcciModeTestResult") {
         ddcciModeTestResult = data.value
@@ -1794,32 +1799,36 @@ const setIsRefreshing = newValue => {
 
 refreshMonitorsJob = async (fullRefresh = false) => {
   return await new Promise((resolve, reject) => {
+    let timeout
+    const worker = monitorsThreadReal
+    const onResult = data => {
+      cleanup()
+      resolve(data.monitors)
+    }
+    const cleanup = () => {
+      clearTimeout(timeout)
+      monitorsEventEmitter.removeListener("refreshMonitors", onResult)
+    }
     try {
-      monitorsThread.send({
+      // Listen before sending, so a fast reply cannot be missed.
+      monitorsEventEmitter.on("refreshMonitors", onResult)
+      timeout = setTimeout(() => {
+        cleanup()
+        const error = new Error("Monitor thread timed out.")
+        error.code = "MONITOR_REFRESH_TIMEOUT"
+        error.worker = worker
+        reject(error)
+      }, 60000)
+      Promise.resolve(monitorsThread.send({
         type: "refreshMonitors",
         fullRefresh
+      })).catch(e => {
+        cleanup()
+        reject(e)
       })
-
-      let timeout = setTimeout(() => {
-        reject("Monitor thread timed out.")
-
-        // Attempt to fix common issue with wmi-bridge by relying only on Win32
-        // However, if user re-enables WMI, don't disable it again
-        if (!settings.autoDisabledWMI && !recentlyWokeUp) {
-          settings.autoDisabledWMI = true
-          settings.disableWMI = true
-        }
-      }, 60000)
-
-      function listen(resolve) {
-        monitorsThread.once("refreshMonitors", data => {
-          clearTimeout(timeout)
-          resolve(data.monitors)
-        })
-      }
-      listen(resolve)
     } catch (e) {
-      reject("Monitor thread failed to send.")
+      cleanup()
+      reject(e)
     }
   })
 }
@@ -1832,6 +1841,10 @@ async function refreshMonitors(fullRefresh = false, bypassRateLimit = false) {
     console.log("Displays are off, no updates.")
     return monitors
   }
+
+  // A wake event may arrive before the startup worker was created. A later
+  // refresh request should also be able to start it.
+  if (!monitorsThreadReady && !monitorsThreadStarting) startMonitorThread()
 
   if (!monitorsThreadReady || pausedMonitorUpdates) {
     console.log("Sorry, no updates right now!")
@@ -1868,6 +1881,7 @@ async function refreshMonitors(fullRefresh = false, bypassRateLimit = false) {
   let newMonitors
 
   let failed = false
+  let timedOutWorker = false
   try {
     newMonitors = await refreshMonitorsJob(fullRefresh)
     if (!newMonitors) {
@@ -1876,6 +1890,8 @@ async function refreshMonitors(fullRefresh = false, bypassRateLimit = false) {
     }
     lastEagerUpdate = Date.now()
   } catch (e) {
+    failed = true
+    if (e?.code === "MONITOR_REFRESH_TIMEOUT") timedOutWorker = e.worker
     console.log('Couldn\'t refresh monitors', e)
   }
 
@@ -1927,6 +1943,16 @@ async function refreshMonitors(fullRefresh = false, bypassRateLimit = false) {
 
   console.log("\x1b[34m---------------------------------------------- \x1b[0m")
   setIsRefreshing(false)
+  if (timedOutWorker && timedOutWorker === monitorsThreadReal) {
+    // A native monitor call can leave the worker alive but unable to answer
+    // further requests. Replace it and build a fresh monitor inventory.
+    refreshAfterMonitorThreadRestart = true
+    timedOutWorker.once("exit", () => {
+      if (timedOutWorker !== monitorsThreadReal) return
+      setTimeout(() => startMonitorThread(), 1000)
+    })
+    stopMonitorThread()
+  }
   return monitors;
 }
 
@@ -2659,6 +2685,9 @@ function createPanel(toggleOnLoad = false, isRefreshing = false, showOnLoad = tr
         if(isWindowsUserIdle) {
           isWindowsUserIdle = false
           console.log("Displays have woken up.")
+          // Startup can skip the monitor worker while the displays are off.
+          // A refresh cannot create it, so start it when the user returns.
+          if (!monitorsThreadReady) startMonitorThread()
           recentlyWokeUp = true
           handleMetricsChange("GUID_SESSION_USER_PRESENCE")
           setTimeout(() => {
